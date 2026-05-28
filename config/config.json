@@ -1,0 +1,65 @@
+{
+  "development": {
+    "config_id": "development",
+    "port": 8083,
+    "hostAddress": "localhost",
+    "dbPort": 5432,
+    "userName": "postgres",
+    "databasePassword": "password",
+    "databaseName": "nowa_mm",
+    "dbCredential": {},
+    "jwtsecret": "nodejwt",
+    "jwtresetsecret": "nodejwt",
+    "jwtOptions": {
+      "expiresIn": "24h"
+    },
+    "swaggerDefinition": {
+      "info": {
+        "title": "Nowa MM",
+        "version": "1.0",
+        "description": "API documentation for the Nowa Refferal Backend. All apis written in node js."
+      },
+      "basePath": "/api/v1",
+      "securityDefinitions": {
+        "tokenauth": {
+          "type": "apiKey",
+          "name": "Authorization",
+          "in": "header"
+        }
+      }
+    
+    },
+   
+    "GOOGLE_RECAPTCHA_SECRET":""
+  },
+  "staging": {
+    "config_id": "staging",
+    "port": 8083,
+    "hostAddress": "103.182.210.198:5439",
+    "userName": "pgreferral",
+    "databasePassword": "kcedeihTYYd",
+    "databaseName": "nowareferral",
+    "jwtsecret": "nodejwt",
+    "jwtresetsecret": "nodejwt",
+    "jwtOptions": {
+      "expiresIn": "24h"
+    },
+    "swaggerDefinition": {
+      "info": {
+        "title": "Nowa Refferal Backend",
+        "version": "1.0",
+        "description": "API documentation for the Nowa Refferal Backend. All apis written in node js."
+      },
+      "basePath": "/api/v1",
+      "securityDefinitions": {
+        "tokenauth": {
+          "type": "apiKey",
+          "name": "Authorization",
+          "in": "header"
+        }
+      }
+    },
+      "GOOGLE_RECAPTCHA_SECRET":"6LdcDb0rAAAAAIK-1Sp2-wFNa6X4u_JeZeJ2AJtk"
+  }
+ 
+}
