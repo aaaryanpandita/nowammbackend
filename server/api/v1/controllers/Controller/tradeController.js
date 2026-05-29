@@ -72,7 +72,7 @@ async function operatorWithdrawHalfToken0(vaultAddress, token0Address, totalBala
   const vault = new ethers.Contract(vaultAddress, vaultAbi, operator);
 
   const withdrawAmount = totalBalance / BigInt(2);
-  const tradeAmount = withdrawAmount / BigInt(2);
+  const tradeAmount = withdrawAmount;
 
   console.log("Withdrawing token0 amount: " + withdrawAmount.toString());
 
@@ -84,35 +84,65 @@ async function operatorWithdrawHalfToken0(vaultAddress, token0Address, totalBala
   return { withdrawAmount, tradeAmount, withdrawTxHash: receipt.hash };
 }
 
-// ===== MARKET SELL token0 → receive token1 =====
 async function submitMarketSellOrder(authToken, tradeAmount, token0, token1, pairSymbol, vaultAddress) {
 
-   const bestBidPrice = await getBestBid(pairSymbol);
-  console.log("Best bid price:", bestBidPrice);
+  // Step 1 — Fetch best bid
+  const orderbookRes = await fetch("https://nowapi-orderbook.tarality.io/api/market/orderbook/" + pairSymbol);
+  const orderbookData = await orderbookRes.json();
+  const bids = orderbookData.data.bids;
+  if (!bids || bids.length === 0) throw new Error("No bids in orderbook");
 
+  const bestBidPrice = bids[0][0];
+  const bestBidQty = bids[0][1];
+  console.log("Best bid price:", bestBidPrice, "| qty:", bestBidQty);
+
+  // Step 2 — Token decimals
   const tokenContract = new ethers.Contract(token0, erc20Abi, provider);
   const decimals = await tokenContract.decimals();
 
-  const amountInPips = Number(ethers.formatUnits(tradeAmount, decimals)) * 1e8;
-  const amountPips = BigInt(Math.floor(amountInPips));
-  const quantityString = ethers.formatUnits(tradeAmount, decimals);
-  const currentNonce = BigInt(Math.floor(Date.now() / 1000));
-const limitPricePips = BigInt(Math.floor(Number(bestBidPrice) * 1e8));
-  // Approve token0 (the token we are selling)
-  await approveToken(token0, vaultAddress, operator);
+  // Step 3 — Compute finalQty (smaller of tradeAmount vs available bid qty)
+  const tradeAmountFormatted = Number(ethers.formatUnits(tradeAmount, decimals));
+  const availableQty = Number(bestBidQty);
+  const finalQty = Math.min(tradeAmountFormatted, availableQty);
+  console.log("Trade amount:", tradeAmountFormatted, "| Available qty:", availableQty, "| Final qty:", finalQty);
+
+  if (finalQty <= 0) throw new Error("Final trade quantity is 0 — no liquidity");
+
+  // amount = finalQty * 1e8 (pips) — matches real frontend
+  const amountPips = BigInt(Math.round(finalQty * 1e8));
+
+  // quantity string for payload
+  const quantityString = finalQty.toFixed(18).replace(/0+$/, "").replace(/\.$/, "");
+
+  // limitPrice = bestBidPrice * 1e8
+  const bestBidPricePips = BigInt(Math.round(Number(bestBidPrice) * 1e8));
+
+  // nonce = crypto random uint64
+  const nonceBytes = new Uint8Array(8);
+  crypto.getRandomValues(nonceBytes);
+  const currentNonce = nonceBytes.reduce((acc, b) => (acc << BigInt(8)) | BigInt(b), BigInt(0)) >> BigInt(1);
 
   const ZERO = BigInt(0);
 
+  console.log("amountPips:", amountPips.toString());
+  console.log("quantityString:", quantityString);
+  console.log("bestBidPricePips:", bestBidPricePips.toString());
+  console.log("nonce:", currentNonce.toString());
+
+  // Step 4 — Approve token0
+  await approveToken(token0, vaultAddress, operator);
+
+  // Step 5 — Build order
   const sellOrder = {
     userAddress: operator.address,
-    baseToken: token0,           // token0 is always baseToken (what we sell)
-    quoteToken: token1,           // token1 is always quoteToken (what we receive)
+    baseToken: token0,
+    quoteToken: token1,
     amount: amountPips,
-    isAmountInQuote: false,        // amount is in token0 units
+    isAmountInQuote: false,
     nonce: currentNonce,
-    orderType: 0,               // market
-    side: 1,               // sell
-    limitPrice: limitPricePips,
+    orderType: 0,              // market
+    side: 1,                   // sell
+    limitPrice: bestBidPricePips,
     stopPrice: ZERO,
     timeInForce: 0,
     cancelAfter: ZERO,
@@ -121,10 +151,12 @@ const limitPricePips = BigInt(Math.floor(Number(bestBidPrice) * 1e8));
     walletSignature: "0x"
   };
 
+  // Step 6 — Sign
   sellOrder.walletSignature = await signOrder(sellOrder, operator);
 
+  // Step 7 — Build payload
   const payload = {
-    orderData: {
+    libOrder: {
       userAddress: sellOrder.userAddress,
       baseToken: sellOrder.baseToken,
       quoteToken: sellOrder.quoteToken,
@@ -137,17 +169,22 @@ const limitPricePips = BigInt(Math.floor(Number(bestBidPrice) * 1e8));
       stopPrice: sellOrder.stopPrice.toString(),
       timeInForce: sellOrder.timeInForce,
       cancelAfter: sellOrder.cancelAfter.toString(),
-      walletSignature: sellOrder.walletSignature,
       balanceSnapshot: sellOrder.balanceSnapshot.toString(),
       allowanceSnapshot: sellOrder.allowanceSnapshot.toString()
+      // ❌ walletSignature yahan se hatao
     },
-    side: "sell",
+    signature: sellOrder.walletSignature,  // ✅ top level pe daalo
+    side: "SELL",
     type: "market",
     quantity: quantityString,
-    price: "0",
-    pairSymbol: pairSymbol
+    price: bestBidPrice,
+    pairSymbol: pairSymbol,
+    signingScheme: "personal-v1",
+    timeInForce: "GTC",
+    nonce: currentNonce.toString()
   };
 
+  // Step 8 — Submit
   const orderRes = await fetch("https://nowapi-orderbook.tarality.io/api/orders", {
     method: "POST",
     headers: {
@@ -158,55 +195,49 @@ const limitPricePips = BigInt(Math.floor(Number(bestBidPrice) * 1e8));
   });
 
   const orderData = await orderRes.json();
-  console.log("Order response:", orderData);
+  console.log("Order response:", JSON.stringify(orderData, null, 2));
   return { orderData, quantityString };
 }
 
 
 // ===== FETCH txHash + txStatus FROM ORDERBOOK AFTER ORDER SUBMIT =====
-async function fetchTxHashFromOrderbook(orderId, pairSymbol, retries, delayMs) {
-  retries = retries || 8;
+async function fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, retries, delayMs) {
+  retries = retries || 10;
   delayMs = delayMs || 3000;
 
   for (var i = 0; i < retries; i++) {
     try {
-      var url = "https://nowapi-orderbook.tarality.io/api/market/trades/" + pairSymbol + "?limit=50";
-      var res = await fetch(url);
-      var data = await res.json();
-
-      if (data && data.success && data.data && data.data.length > 0) {
-        // Match our orderId against takerOrderId OR makerOrderId
-        var match = null;
-        for (var j = 0; j < data.data.length; j++) {
-          var t = data.data[j];
-          if (t.takerOrderId === orderId || t.makerOrderId === orderId) {
-            match = t;
-            break;
-          }
+      const res = await fetch("https://nowapi-orderbook.tarality.io/api/trades?page=1&limit=50", {
+        headers: {
+          "Authorization": "Bearer " + authToken  // ← auth chahiye private endpoint ke liye
         }
+      });
+      const data = await res.json();
 
-        if (match) {
-          console.log("Matched trade from orderbook:", match.id, "txHash:", match.txHash);
+      if (data && data.data && data.data.length > 0) {
+        // orderId se match karo
+        const match = data.data.find(t => t.orderId === orderId);
+
+        if (match && match.txHash) {
+          console.log("Matched trade:", match.id, "txHash:", match.txHash);
           return {
-            txHash: match.txHash || null,
-            txStatus: (match.metadata && match.metadata.txStatus) || "pending",
-            tradeId: match.id,
+            txHash: match.txHash,
+            txStatus: "confirmed",
             price: match.price || "0",
             quantity: match.quantity || "0"
           };
         }
       }
     } catch (err) {
-      console.log("fetchTxHash attempt " + (i + 1) + " failed: " + err.message);
+      console.log("fetchTxHash attempt " + (i + 1) + " failed:", err.message);
     }
 
-    // Wait before next retry
     if (i < retries - 1) {
-      await new Promise(function (r) { setTimeout(r, delayMs); });
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
-  console.log("Could not find txHash for orderId: " + orderId + " after " + retries + " retries");
+  console.log("Could not find txHash for orderId:", orderId);
   return null;
 }
 
@@ -222,7 +253,7 @@ async function getBestBid(pairSymbol) {
 class tradeController {
 
 
-  
+
   /**
    * @swagger
    * /trade/executeTrade:
@@ -260,91 +291,92 @@ class tradeController {
    */
 
 
-  
 
-async executeTrade(req, res, next) {
-  const validSchema = Joi.object({
-    token0: Joi.string().required(),
-    token1: Joi.string().required(),
-    pairSymbol: Joi.string().required()
-  });
-  try {
-    const { error, value } = validSchema.validate(req.query);
-    if (error) throw apiError.badRequest(error.details[0].message);
-    const { token0, token1, pairSymbol } = value;
 
-    // Step 1 — Get vault address from factory using (token0, token1)
-    const vaultAddress = await getVaultAddress(token0, token1);
-    console.log("Vault address: " + vaultAddress);
-
-    // Step 2 — Check token0 balance in vault (we only ever sell token0)
-    const vaultBalance = await getVaultToken0Balance(vaultAddress, token0);
-    console.log("Vault token0 balance: " + vaultBalance.toString());
-
-    if (vaultBalance.toString() === "0") {
-      throw apiError.badRequest("Vault has no token0 balance (" + token0 + ") — nothing to trade");
-    }
-
-    // Step 3 — Withdraw 50% of token0 from vault; trade with 50% of that
-    const withdrawResult = await operatorWithdrawHalfToken0(vaultAddress, token0, vaultBalance);
-    console.log("Withdrawn token0 amount : " + withdrawResult.withdrawAmount.toString());
-    console.log("Trade token0 amount     : " + withdrawResult.tradeAmount.toString());
-
-    // Step 4 — Authenticate operator wallet
-    const authToken = await authenticateWallet(operator);
-
-    // Step 5 — Place market SELL order: spend token0, receive token1
-    const orderResult = await submitMarketSellOrder(
-      authToken,
-      withdrawResult.tradeAmount,
-      token0,
-      token1,
-      pairSymbol,
-      vaultAddress
-    );
-
-    // Step 6 — Extract orderId from order submit response
-    const orderData = orderResult.orderData;
-    const orderId = (orderData && orderData.data && orderData.data.id) || null;
-    console.log("Submitted orderId:", orderId);
-
-    // Step 7 — Wait for txHash (blocking — response tabhi aayega)
-    const matchedTrade = await fetchTxHashFromOrderbook(orderId, pairSymbol, 20, 5000);
-
-    if (!matchedTrade || !matchedTrade.txHash) {
-      throw apiError.badRequest("Trade submitted but txHash nahi mila — orderId: " + orderId);
-    }
-
-    console.log("txHash mila:", matchedTrade.txHash, "status:", matchedTrade.txStatus);
-
-    // Step 8 — DB mein save karo jab txHash aa gaya
-    const trade = await db.trades.create({
-      orderId,
-      txHash: matchedTrade.txHash,
-      status: matchedTrade.txStatus || "confirmed",
-      side: "sell",
-      type: "market",
-      quantity: orderResult.quantityString,
-      price: matchedTrade.price || "0",
-      pairSymbol,
-      baseToken: token0,
-      quoteToken: token1,
-      withdrawTxHash: withdrawResult.withdrawTxHash
+  async executeTrade(req, res, next) {
+    const validSchema = Joi.object({
+      token0: Joi.string().required(),
+      token1: Joi.string().required(),
+      pairSymbol: Joi.string().required()
     });
+    try {
+      const { error, value } = validSchema.validate(req.query);
+      if (error) throw apiError.badRequest(error.details[0].message);
+      const { token0, token1, pairSymbol } = value;
 
-    // Step 9 — Ab response do — txHash + confirmed status ke saath
-    return res.json(new response({ trade }, responseMessage.TRADE_EXECUTED));
+      // Step 1 — Get vault address from factory using (token0, token1)
+      const vaultAddress = await getVaultAddress(token0, token1);
+      console.log("Vault address: " + vaultAddress);
 
-  } catch (error) {
-    if (error && error.code && typeof error.code === "string" && isNaN(Number(error.code))) {
-      return res.status(500).json({
-        responseCode: 500,
-        responseMessage: "Blockchain error: " + (error.reason || error.shortMessage || error.message || error.code)
+      // Step 2 — Check token0 balance in vault (we only ever sell token0)
+      const vaultBalance = await getVaultToken0Balance(vaultAddress, token0);
+      console.log("Vault token0 balance: " + vaultBalance.toString());
+
+      if (vaultBalance.toString() === "0") {
+        throw apiError.badRequest("Vault has no token0 balance (" + token0 + ") — nothing to trade");
+      }
+
+      // Step 3 — Withdraw 50% of token0 from vault; trade with 50% of that
+      const withdrawResult = await operatorWithdrawHalfToken0(vaultAddress, token0, vaultBalance);
+      console.log("Withdrawn token0 amount : " + withdrawResult.withdrawAmount.toString());
+      console.log("Trade token0 amount     : " + withdrawResult.tradeAmount.toString());
+
+      // Step 4 — Authenticate operator wallet
+      const authToken = await authenticateWallet(operator);
+
+      // Step 5 — Place market SELL order: spend token0, receive token1
+      const orderResult = await submitMarketSellOrder(
+        authToken,
+        withdrawResult.tradeAmount,
+        token0,
+        token1,
+        pairSymbol,
+        vaultAddress
+      );
+
+      // Step 6 — Extract orderId from order submit response
+      const orderData = orderResult.orderData;
+      const orderId = (orderData && orderData.data && orderData.data.id) || null;
+      console.log("Submitted orderId:", orderId);
+
+      // Step 7 — Wait for txHash (blocking — response tabhi aayega)
+      // Step 7
+      const matchedTrade = await fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, 20, 5000);
+      //                                                                         ↑ authToken add kiya
+      if (!matchedTrade || !matchedTrade.txHash) {
+        throw apiError.badRequest("Trade submitted but txHash nahi mila — orderId: " + orderId);
+      }
+
+      console.log("txHash mila:", matchedTrade.txHash, "status:", matchedTrade.txStatus);
+
+      // Step 8 — DB mein save karo jab txHash aa gaya
+      const trade = await db.trades.create({
+        orderId,
+        txHash: matchedTrade.txHash,
+        status: matchedTrade.txStatus || "confirmed",
+        side: "sell",
+        type: "market",
+        quantity: orderResult.quantityString,
+        price: matchedTrade.price || "0",
+        pairSymbol,
+        baseToken: token0,
+        quoteToken: token1,
+        withdrawTxHash: withdrawResult.withdrawTxHash
       });
+
+      // Step 9 — Ab response do — txHash + confirmed status ke saath
+      return res.json(new response({ trade }, responseMessage.TRADE_EXECUTED));
+
+    } catch (error) {
+      if (error && error.code && typeof error.code === "string" && isNaN(Number(error.code))) {
+        return res.status(500).json({
+          responseCode: 500,
+          responseMessage: "Blockchain error: " + (error.reason || error.shortMessage || error.message || error.code)
+        });
+      }
+      return next(error);
     }
-    return next(error);
   }
-}
 
   /**
    * @swagger
