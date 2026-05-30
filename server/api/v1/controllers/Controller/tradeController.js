@@ -6,8 +6,10 @@ import response from "../../../../../assets/response.js";
 import responseMessage from "../../../../../assets/responseMessage.js";
 import db from "../../../../helper/tableSync.js";
 
+console.log("the key is",process.env.PRIVATE_KEY)
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const operator = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+const operator  = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+
 
 const factoryAbi = [
   "function getVaultAddress(address token0, address token1) external view returns (address)"
@@ -23,31 +25,25 @@ const erc20Abi = [
   "function balanceOf(address account) view returns (uint256)"
 ];
 
-async function signOrder(order, signer) {
-  const encoded = ethers.solidityPacked(
-    ["address", "address", "address", "uint64", "bool", "uint128", "uint8", "uint8", "uint64", "uint64", "uint8", "uint64", "uint64", "uint64"],
-    [order.userAddress, order.baseToken, order.quoteToken, order.amount, order.isAmountInQuote, order.nonce, order.orderType, order.side, order.limitPrice, order.stopPrice, order.timeInForce, order.cancelAfter, order.balanceSnapshot, order.allowanceSnapshot]
-  );
-  const hash = ethers.keccak256(encoded);
-  return await signer.signMessage(ethers.getBytes(hash));
-}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function approveToken(tokenAddress, spenderAddress, signer) {
   const token = new ethers.Contract(tokenAddress, erc20Abi, signer);
-  const tx = await token.approve(spenderAddress, ethers.MaxUint256);
+  const tx    = await token.approve(spenderAddress, ethers.MaxUint256);
   await tx.wait();
-  console.log("Approved token0: " + tokenAddress);
+  console.log("Approved token: " + tokenAddress);
 }
 
 async function authenticateWallet(wallet) {
-  const nonceRes = await fetch("https://nowapi-orderbook.tarality.io/api/auth/nonce?address=" + wallet.address);
+  const nonceRes  = await fetch("https://nowapi-orderbook.tarality.io/api/auth/nonce?address=" + wallet.address);
   const nonceData = await nonceRes.json();
   if (!nonceData.success) throw new Error("Failed to get nonce");
   const signature = await wallet.signMessage(nonceData.message);
-  const loginRes = await fetch("https://nowapi-orderbook.tarality.io/api/auth/login", {
-    method: "POST",
+  const loginRes  = await fetch("https://nowapi-orderbook.tarality.io/api/auth/login", {
+    method : "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ address: wallet.address, message: nonceData.message, signature: signature })
+    body   : JSON.stringify({ address: wallet.address, message: nonceData.message, signature: signature })
   });
   const loginData = await loginRes.json();
   if (!loginData.success) throw new Error("Login failed: " + loginData.error);
@@ -59,200 +55,207 @@ async function getVaultAddress(token0, token1) {
   return await factory.getVaultAddress(token0, token1);
 }
 
-// ===== CHECK VAULT BALANCE OF TOKEN0 =====
-// token0 contract ka balanceOf(vaultAddress) call karo
 async function getVaultToken0Balance(vaultAddress, token0Address) {
-  const token = new ethers.Contract(token0Address, erc20Abi, provider);
+  const token   = new ethers.Contract(token0Address, erc20Abi, provider);
   const balance = await token.balanceOf(vaultAddress);
-  console.log("Vault token0 balance (from token contract): " + balance.toString());
+  console.log("Vault token0 balance: " + balance.toString());
   return BigInt(balance.toString());
 }
 
-async function operatorWithdrawHalfToken0(vaultAddress, token0Address, totalBalance) {
+
+// ─── Step 1: Withdraw 50% from vault, trade 50% of that = 25% total ──────────
+//
+//   vaultBalance   = full token0 in vault
+//   withdrawAmount = vaultBalance / 2       <- withdraw 50%
+//   tradeAmount    = withdrawAmount / 2     <- trade 50% of withdrawn = 25% total
+//
+async function operatorWithdrawAndGetTradeAmount(vaultAddress, token0Address, totalBalance) {
   const vault = new ethers.Contract(vaultAddress, vaultAbi, operator);
 
   const withdrawAmount = totalBalance / BigInt(2);
-  const tradeAmount = withdrawAmount;
+  const tradeAmount    = withdrawAmount / BigInt(2);
 
-  console.log("Withdrawing token0 amount: " + withdrawAmount.toString());
+  console.log("Total vault balance   : " + totalBalance.toString());
+  console.log("Withdraw amount (50%) : " + withdrawAmount.toString());
+  console.log("Trade amount    (25%) : " + tradeAmount.toString());
 
-  // ✅ operator.address as `to` — tokens operator ke wallet mein aayenge
-  const tx = await vault.operatorWithdraw(token0Address, operator.address, withdrawAmount);
+  const tx      = await vault.operatorWithdraw(token0Address, operator.address, withdrawAmount);
   const receipt = await tx.wait();
-  console.log("Withdraw TX (token0): " + receipt.hash);
+  console.log("Withdraw TX: " + receipt.hash);
 
-  return { withdrawAmount, tradeAmount, withdrawTxHash: receipt.hash };
+  return { withdrawAmount: withdrawAmount, tradeAmount: tradeAmount, withdrawTxHash: receipt.hash };
 }
 
-async function submitMarketSellOrder(authToken, tradeAmount, token0, token1, pairSymbol, vaultAddress) {
 
-  // Step 1 — Fetch best bid
-  const orderbookRes = await fetch("https://nowapi-orderbook.tarality.io/api/market/orderbook/" + pairSymbol);
-  const orderbookData = await orderbookRes.json();
-  const bids = orderbookData.data.bids;
-  if (!bids || bids.length === 0) throw new Error("No bids in orderbook");
+// ─── Step 2: Market SELL with IOC ─────────────────────────────────────────────
 
-  const bestBidPrice = bids[0][0];
-  const bestBidQty = bids[0][1];
-  console.log("Best bid price:", bestBidPrice, "| qty:", bestBidQty);
+async function submitMarketSellOrder(authToken, tradeAmount, token0, token1, pairSymbol) {
 
-  // Step 2 — Token decimals
+  // Fetch best bid
+  const obRes  = await fetch("https://nowapi-orderbook.tarality.io/api/orderbook/" + pairSymbol);
+  const obData = await obRes.json();
+
+  if (!obData.success || !obData.data || !obData.data.bids || obData.data.bids.length === 0) {
+    throw new Error("No bids in orderbook");
+  }
+
+  const bestBidPrice = obData.data.bids[0][0];
+  const bestBidQty   = obData.data.bids[0][1];
+  console.log("Best bid price: " + bestBidPrice + " | qty: " + bestBidQty);
+
+  // Token decimals
   const tokenContract = new ethers.Contract(token0, erc20Abi, provider);
-  const decimals = await tokenContract.decimals();
+  const decimals      = await tokenContract.decimals();
 
-  // Step 3 — Compute finalQty (smaller of tradeAmount vs available bid qty)
+  // finalQty = min(25% tradeAmount, best bid qty)
   const tradeAmountFormatted = Number(ethers.formatUnits(tradeAmount, decimals));
-  const availableQty = Number(bestBidQty);
-  const finalQty = Math.min(tradeAmountFormatted, availableQty);
-  console.log("Trade amount:", tradeAmountFormatted, "| Available qty:", availableQty, "| Final qty:", finalQty);
+  const availableQty         = Number(bestBidQty);
+  const finalQty             = Math.min(tradeAmountFormatted, availableQty);
+
+  console.log("Trade amount (25%) : " + tradeAmountFormatted);
+  console.log("Available bid qty  : " + availableQty);
+  console.log("Final sell qty     : " + finalQty);
 
   if (finalQty <= 0) throw new Error("Final trade quantity is 0 — no liquidity");
 
-  // amount = finalQty * 1e8 (pips) — matches real frontend
-  const amountPips = BigInt(Math.round(finalQty * 1e8));
+  const amountRaw    = Math.floor(finalQty * 1e8).toString();
+  const quantityStr  = finalQty.toString();
+  const currentNonce = Date.now();
 
-  // quantity string for payload
-  const quantityString = finalQty.toFixed(18).replace(/0+$/, "").replace(/\.$/, "");
+  // Approve token0 against contract
+  await approveToken(token0, process.env.CONTRACT_ADDRESS, operator);
 
-  // limitPrice = bestBidPrice * 1e8
-  const bestBidPricePips = BigInt(Math.round(Number(bestBidPrice) * 1e8));
-
-  // nonce = crypto random uint64
-  const nonceBytes = new Uint8Array(8);
-  crypto.getRandomValues(nonceBytes);
-  const currentNonce = nonceBytes.reduce((acc, b) => (acc << BigInt(8)) | BigInt(b), BigInt(0)) >> BigInt(1);
-
-  const ZERO = BigInt(0);
-
-  console.log("amountPips:", amountPips.toString());
-  console.log("quantityString:", quantityString);
-  console.log("bestBidPricePips:", bestBidPricePips.toString());
-  console.log("nonce:", currentNonce.toString());
-
-  // Step 4 — Approve token0
-  await approveToken(token0, vaultAddress, operator);
-
-  // Step 5 — Build order
-  const sellOrder = {
-    userAddress: operator.address,
-    baseToken: token0,
-    quoteToken: token1,
-    amount: amountPips,
-    isAmountInQuote: false,
-    nonce: currentNonce,
-    orderType: 0,              // market
-    side: 1,                   // sell
-    limitPrice: bestBidPricePips,
-    stopPrice: ZERO,
-    timeInForce: 0,
-    cancelAfter: ZERO,
-    balanceSnapshot: ZERO,
-    allowanceSnapshot: ZERO,
-    walletSignature: "0x"
+  // Build libOrder — market + IOC
+  const libOrder = {
+    userAddress      : operator.address,
+    baseToken        : token0,
+    quoteToken       : token1,
+    amount           : amountRaw,
+    isAmountInQuote  : false,
+    nonce            : currentNonce,
+    orderType        : 0,
+    side             : 1,
+    limitPrice       : "0",
+    stopPrice        : "0",
+    timeInForce      : 2,
+    cancelAfter      : "0",
+    balanceSnapshot  : "0",
+    allowanceSnapshot: "0"
   };
 
-  // Step 6 — Sign
-  sellOrder.walletSignature = await signOrder(sellOrder, operator);
+  // Get order hash and sign
+  const contract = new ethers.Contract(
+    process.env.CONTRACT_ADDRESS,
+    ["function getOrderHash(tuple(address userAddress,address baseToken,address quoteToken,uint64 amount,bool isAmountInQuote,uint128 nonce,uint8 orderType,uint8 side,uint64 limitPrice,uint64 stopPrice,uint8 timeInForce,uint64 cancelAfter,bytes walletSignature,uint64 balanceSnapshot,uint64 allowanceSnapshot) order) view returns (bytes32)"],
+    provider
+  );
 
-  // Step 7 — Build payload
+  const orderForHash       = Object.assign({}, libOrder, { walletSignature: "0x" });
+  const orderHash          = await contract.getOrderHash(orderForHash);
+  const personalSignature  = await operator.signMessage(ethers.getBytes(orderHash));
+  libOrder.walletSignature = personalSignature;
+
   const payload = {
-    libOrder: {
-      userAddress: sellOrder.userAddress,
-      baseToken: sellOrder.baseToken,
-      quoteToken: sellOrder.quoteToken,
-      amount: sellOrder.amount.toString(),
-      isAmountInQuote: sellOrder.isAmountInQuote,
-      nonce: sellOrder.nonce.toString(),
-      orderType: sellOrder.orderType,
-      side: sellOrder.side,
-      limitPrice: sellOrder.limitPrice.toString(),
-      stopPrice: sellOrder.stopPrice.toString(),
-      timeInForce: sellOrder.timeInForce,
-      cancelAfter: sellOrder.cancelAfter.toString(),
-      balanceSnapshot: sellOrder.balanceSnapshot.toString(),
-      allowanceSnapshot: sellOrder.allowanceSnapshot.toString()
-      // ❌ walletSignature yahan se hatao
-    },
-    signature: sellOrder.walletSignature,  // ✅ top level pe daalo
-    side: "SELL",
-    type: "market",
-    quantity: quantityString,
-    price: bestBidPrice,
-    pairSymbol: pairSymbol,
+    pairSymbol   : pairSymbol,
+    side         : "sell",
+    type         : "market",
+    quantity     : quantityStr,
+    stopPrice    : "0",
+    timeInForce  : "IOC",
+    signature    : personalSignature,
     signingScheme: "personal-v1",
-    timeInForce: "GTC",
-    nonce: currentNonce.toString()
+    nonce        : currentNonce,
+    libOrder     : libOrder
   };
 
-  // Step 8 — Submit
-  const orderRes = await fetch("https://nowapi-orderbook.tarality.io/api/orders", {
-    method: "POST",
+  console.log("Submitting order payload: " + JSON.stringify(payload, null, 2));
+
+  const placedAt = new Date().toISOString();
+
+  const orderRes  = await fetch("https://nowapi-orderbook.tarality.io/api/orders", {
+    method : "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type" : "application/json",
       "Authorization": "Bearer " + authToken
     },
     body: JSON.stringify(payload)
   });
 
-  const orderData = await orderRes.json();
-  console.log("Order response:", JSON.stringify(orderData, null, 2));
-  return { orderData, quantityString };
+  const orderData     = await orderRes.json();
+  orderData._placedAt = placedAt;
+
+  console.log("Order response: " + JSON.stringify(orderData, null, 2));
+  return { orderData: orderData, quantityStr: quantityStr };
 }
 
 
-// ===== FETCH txHash + txStatus FROM ORDERBOOK AFTER ORDER SUBMIT =====
-async function fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, retries, delayMs) {
-  retries = retries || 10;
+// ─── Step 3: Poll trades for txHash — DB save ONLY after txHash confirmed ─────
+
+async function fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, placedAt, retries, delayMs) {
+  retries = retries || 20;
   delayMs = delayMs || 3000;
 
+  console.log("Polling /api/trades for txHash (orderId: " + orderId + ")...");
+
   for (var i = 0; i < retries; i++) {
+    await new Promise(function(r) { return setTimeout(r, delayMs); });
+
     try {
-      const res = await fetch("https://nowapi-orderbook.tarality.io/api/trades?page=1&limit=50", {
-        headers: {
-          "Authorization": "Bearer " + authToken  // ← auth chahiye private endpoint ke liye
-        }
+      const res    = await fetch("https://nowapi-orderbook.tarality.io/api/trades?page=1&limit=50", {
+        headers: { "Authorization": "Bearer " + authToken }
       });
-      const data = await res.json();
+      const data   = await res.json();
+      const trades = (data && data.data) ? data.data : [];
 
-      if (data && data.data && data.data.length > 0) {
-        // orderId se match karo
-        const match = data.data.find(t => t.orderId === orderId);
-
-        if (match && match.txHash) {
-          console.log("Matched trade:", match.id, "txHash:", match.txHash);
-          return {
-            txHash: match.txHash,
-            txStatus: "confirmed",
-            price: match.price || "0",
-            quantity: match.quantity || "0"
-          };
+      // Primary: match by orderId
+      var matched = null;
+      for (var j = 0; j < trades.length; j++) {
+        if (trades[j].orderId === orderId && trades[j].txHash) {
+          matched = trades[j];
+          break;
         }
       }
-    } catch (err) {
-      console.log("fetchTxHash attempt " + (i + 1) + " failed:", err.message);
-    }
 
-    if (i < retries - 1) {
-      await new Promise(r => setTimeout(r, delayMs));
+      // Fallback: side + pairSymbol + executedAt >= placedAt
+      if (!matched) {
+        for (var k = 0; k < trades.length; k++) {
+          var t = trades[k];
+          if (
+            t.side       === "sell" &&
+            t.pairSymbol === pairSymbol &&
+            new Date(t.executedAt) >= new Date(placedAt) &&
+            t.txHash
+          ) {
+            matched = t;
+            break;
+          }
+        }
+      }
+
+      console.log("[" + (i + 1) + "] trades: " + trades.length + " | matched: " + !!matched + " | txHash: " + (matched && matched.txHash ? matched.txHash : "null"));
+
+      if (matched && matched.txHash) {
+        console.log("txHash found: " + matched.txHash);
+        return {
+          txHash  : matched.txHash,
+          txStatus: "confirmed",
+          price   : matched.price    || "0",
+          quantity: matched.quantity || "0"
+        };
+      }
+    } catch (err) {
+      console.log("Poll attempt " + (i + 1) + " failed: " + err.message);
     }
   }
 
-  console.log("Could not find txHash for orderId:", orderId);
+  console.log("txHash not found within timeout for orderId: " + orderId);
   return null;
 }
 
-async function getBestBid(pairSymbol) {
-  const res = await fetch("https://nowapi-orderbook.tarality.io/api/market/orderbook/" + pairSymbol);
-  const data = await res.json();
-  if (data && data.data && data.data.bids && data.data.bids.length > 0) {
-    return data.data.bids[0][0]; // "5800.000000000000000000"
-  }
-  throw new Error("No bids available in orderbook");
-}
+
+// ─── Controller ───────────────────────────────────────────────────────────────
 
 class tradeController {
-
-
 
   /**
    * @swagger
@@ -261,116 +264,106 @@ class tradeController {
    *     tags:
    *       - TRADE
    *     summary: Execute a market SELL trade (token0 to token1)
-   *     description: Checks vault balance of token0. Withdraws 50% via operatorWithdraw. Uses 50% of withdrawn to place a market SELL order (sell token0, receive token1). Saves trade to DB.
+   *     description: Checks vault balance of token0. Withdraws 50%. Trades 25% of total (50% of withdrawn). Places market SELL IOC order. Saves to DB only after txHash confirmed.
    *     parameters:
    *       - in: query
    *         name: token0
    *         required: true
    *         type: string
-   *         description: Address of token0 (baseToken) - the token you SELL e.g. WETH address
    *         example: "0xWETH_ADDRESS"
    *       - in: query
    *         name: token1
    *         required: true
    *         type: string
-   *         description: Address of token1 (quoteToken) - the token you RECEIVE e.g. NUSD address
    *         example: "0xNUSD_ADDRESS"
    *       - in: query
    *         name: pairSymbol
    *         required: true
    *         type: string
-   *         description: Trading pair symbol e.g. WETH_NUSD
    *         example: "WETH_NUSD"
    *     responses:
    *       200:
-   *         description: Trade executed and saved to DB successfully
+   *         description: Trade executed and saved to DB
    *       400:
-   *         description: Validation error or vault has zero token0 balance
+   *         description: Validation error or no vault balance
    *       500:
    *         description: Internal server error
    */
-
-
-
-
   async executeTrade(req, res, next) {
     const validSchema = Joi.object({
-      token0: Joi.string().required(),
-      token1: Joi.string().required(),
+      token0    : Joi.string().required(),
+      token1    : Joi.string().required(),
       pairSymbol: Joi.string().required()
     });
+
     try {
       const { error, value } = validSchema.validate(req.query);
       if (error) throw apiError.badRequest(error.details[0].message);
       const { token0, token1, pairSymbol } = value;
 
-      // Step 1 — Get vault address from factory using (token0, token1)
+      // Step 1 — Vault address
       const vaultAddress = await getVaultAddress(token0, token1);
       console.log("Vault address: " + vaultAddress);
 
-      // Step 2 — Check token0 balance in vault (we only ever sell token0)
+      // Step 2 — Vault token0 balance
       const vaultBalance = await getVaultToken0Balance(vaultAddress, token0);
-      console.log("Vault token0 balance: " + vaultBalance.toString());
-
       if (vaultBalance.toString() === "0") {
         throw apiError.badRequest("Vault has no token0 balance (" + token0 + ") — nothing to trade");
       }
 
-      // Step 3 — Withdraw 50% of token0 from vault; trade with 50% of that
-      const withdrawResult = await operatorWithdrawHalfToken0(vaultAddress, token0, vaultBalance);
-      console.log("Withdrawn token0 amount : " + withdrawResult.withdrawAmount.toString());
-      console.log("Trade token0 amount     : " + withdrawResult.tradeAmount.toString());
+      // Step 3 — Withdraw 50%, get tradeAmount = 25% of total
+      const withdrawResult = await operatorWithdrawAndGetTradeAmount(vaultAddress, token0, vaultBalance);
+      console.log("Withdraw TX  : " + withdrawResult.withdrawTxHash);
+      console.log("Trade amount : " + withdrawResult.tradeAmount.toString());
 
-      // Step 4 — Authenticate operator wallet
+      // Step 4 — Auth
       const authToken = await authenticateWallet(operator);
 
-      // Step 5 — Place market SELL order: spend token0, receive token1
+      // Step 5 — Market sell IOC with 25% amount
       const orderResult = await submitMarketSellOrder(
         authToken,
         withdrawResult.tradeAmount,
         token0,
         token1,
-        pairSymbol,
-        vaultAddress
+        pairSymbol
       );
 
-      // Step 6 — Extract orderId from order submit response
       const orderData = orderResult.orderData;
-      const orderId = (orderData && orderData.data && orderData.data.id) || null;
-      console.log("Submitted orderId:", orderId);
+      const orderId   = (orderData && orderData.data && orderData.data.id) ? orderData.data.id : null;
+      const placedAt  = orderData._placedAt;
+      console.log("Order ID: " + orderId);
 
-      // Step 7 — Wait for txHash (blocking — response tabhi aayega)
-      // Step 7
-      const matchedTrade = await fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, 20, 5000);
-      //                                                                         ↑ authToken add kiya
+      // Step 6 — Wait for txHash — DB save ONLY after this ✅
+      const matchedTrade = await fetchTxHashFromOrderbook(orderId, pairSymbol, authToken, placedAt, 20, 3000);
+
       if (!matchedTrade || !matchedTrade.txHash) {
-        throw apiError.badRequest("Trade submitted but txHash nahi mila — orderId: " + orderId);
+        throw apiError.badRequest("Trade submitted but txHash not received — orderId: " + orderId);
       }
 
-      console.log("txHash mila:", matchedTrade.txHash, "status:", matchedTrade.txStatus);
+      console.log("txHash confirmed: " + matchedTrade.txHash);
 
-      // Step 8 — DB mein save karo jab txHash aa gaya
+      // Step 7 — Save to DB only after txHash confirmed ✅
       const trade = await db.trades.create({
-        orderId,
-        txHash: matchedTrade.txHash,
-        status: matchedTrade.txStatus || "confirmed",
-        side: "sell",
-        type: "market",
-        quantity: orderResult.quantityString,
-        price: matchedTrade.price || "0",
-        pairSymbol,
-        baseToken: token0,
-        quoteToken: token1,
-        withdrawTxHash: withdrawResult.withdrawTxHash
+        orderId        : orderId,
+        txHash         : matchedTrade.txHash,
+        status         : matchedTrade.txStatus || "confirmed",
+        side           : "sell",
+        type           : "market",
+        quantity       : orderResult.quantityStr,
+        price          : matchedTrade.price || "0",
+        pairSymbol     : pairSymbol,
+        baseToken      : token0,
+        quoteToken     : token1,
+        withdrawTxHash : withdrawResult.withdrawTxHash
       });
 
-      // Step 9 — Ab response do — txHash + confirmed status ke saath
-      return res.json(new response({ trade }, responseMessage.TRADE_EXECUTED));
+      // Step 8 — Respond
+      return res.json(new response({ trade: trade }, responseMessage.TRADE_EXECUTED));
 
     } catch (error) {
       if (error && error.code && typeof error.code === "string" && isNaN(Number(error.code))) {
         return res.status(500).json({
-          responseCode: 500,
+          responseCode   : 500,
           responseMessage: "Blockchain error: " + (error.reason || error.shortMessage || error.message || error.code)
         });
       }
@@ -385,26 +378,19 @@ class tradeController {
    *     tags:
    *       - TRADE
    *     summary: Get all trades
-   *     description: Fetch all trade records from the database. Every trade is a market SELL of token0 in exchange for token1. Supports pagination and optional status filter.
    *     parameters:
    *       - in: query
    *         name: page
-   *         required: false
    *         type: integer
-   *         description: Page number (default 1)
    *         example: 1
    *       - in: query
    *         name: limit
-   *         required: false
    *         type: integer
-   *         description: Records per page (default 10)
    *         example: 10
    *       - in: query
    *         name: status
-   *         required: false
    *         type: string
-   *         description: Filter by trade status e.g. submitted, filled, cancelled
-   *         example: "submitted"
+   *         example: "confirmed"
    *     responses:
    *       200:
    *         description: Trades fetched successfully
@@ -413,8 +399,8 @@ class tradeController {
    */
   async getTrades(req, res, next) {
     try {
-      const page = req.query.page ? Number(req.query.page) : 1;
-      const limit = req.query.limit ? Number(req.query.limit) : 10;
+      const page   = req.query.page   ? Number(req.query.page)  : 1;
+      const limit  = req.query.limit  ? Number(req.query.limit) : 10;
       const status = req.query.status || null;
       const offset = (page - 1) * limit;
 
@@ -422,18 +408,19 @@ class tradeController {
       if (status) whereClause.status = status;
 
       const result = await db.trades.findAndCountAll({
-        where: whereClause,
-        limit: limit,
+        where : whereClause,
+        limit : limit,
         offset: offset,
-        order: [["createdAt", "DESC"]]
+        order : [["createdAt", "DESC"]]
       });
 
       return res.json(new response({
         totalTrades: result.count,
         currentPage: page,
-        totalPages: Math.ceil(result.count / limit),
-        trades: result.rows
+        totalPages : Math.ceil(result.count / limit),
+        trades     : result.rows
       }, responseMessage.TRADES_FETCHED));
+
     } catch (error) {
       return next(error);
     }
